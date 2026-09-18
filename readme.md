@@ -1,4 +1,4 @@
-# GridWise Campus Energy Optimizer
+# BUP Campus Energy Optimizer
 
 Backend service built for campus energy scheduling and optimization. The application parses unstructured operator directives using an LLM, applies deterministic guardrails to ensure constraint safety, and solves a 24-hour linear programming cost-minimization problem.
 
