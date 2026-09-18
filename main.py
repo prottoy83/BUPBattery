@@ -65,6 +65,72 @@ class LLMInterpretation(BaseModel):
     directives: List[DirectiveInterpretation]
 
 
+# Guardrail
+
+def apply_guardrails(parsed_directives: List[DirectiveInterpretation], total_notes: int, capacity_kwh: float) -> List[DirectiveInterpretation]:
+    safe_directives = []
+    
+    # Map by note_index to easily check for missing notes
+    directive_map = {d.note_index: d for d in parsed_directives}
+
+    for i in range(total_notes):
+        # 1. Missing Note Fallback
+        if i not in directive_map:
+            safe_directives.append(DirectiveInterpretation(
+                note_index=i, 
+                applies=False, 
+                directive_type="no_op", 
+                structured_adjustment=None, 
+                explanation="Safe Fallback: LLM missed this note."
+            ))
+            continue
+            
+        d = directive_map[i]
+        is_valid = True
+
+        # 2. Enforce 'applies' Semantics
+        if d.directive_type == "no_op":
+            d.applies = False
+            d.structured_adjustment = None
+        else:
+            d.applies = True
+            if not d.structured_adjustment:
+                is_valid = False
+            else:
+                # 3. Time Normalization: Unique integers 0-23 in ascending order
+                raw_hours = d.structured_adjustment.hours
+                valid_hours = sorted(list(set([h for h in raw_hours if 0 <= h <= 23])))
+                d.structured_adjustment.hours = valid_hours
+
+                # 4. Numeric Bounds Verification
+                if d.directive_type == "solar_reduction":
+                    f = d.structured_adjustment.factor
+                    if f is None or not (0.0 <= f <= 1.0):
+                        is_valid = False
+                elif d.directive_type == "minimum_battery_reserve":
+                    m = d.structured_adjustment.minimum_energy_kwh
+                    if m is None or m < 0 or m > capacity_kwh:
+                        is_valid = False
+                elif d.directive_type == "max_grid_window":
+                    g = d.structured_adjustment.max_grid_kwh
+                    if g is None or g < 0:
+                        is_valid = False
+
+        # 5. Safe Failure Execution
+        if not is_valid:
+            safe_directives.append(DirectiveInterpretation(
+                note_index=i, 
+                applies=False, 
+                directive_type="no_op", 
+                structured_adjustment=None, 
+                explanation="Safe Fallback: Directive violated strict numeric guardrails."
+            ))
+        else:
+            safe_directives.append(d)
+
+    return safe_directives
+
+
 
 @app.get("/health")
 async def health_check():
@@ -124,7 +190,7 @@ You MUST return JSON using EXACTLY these field names:
       "applies": true,
       "directive_type": "solar_reduction",
       "structured_adjustment": {
-        "hours": [10, 11, 12],
+        "hours": [12, 13],
         "factor": 0.25,
         "minimum_energy_kwh": null,
         "max_grid_kwh": null
@@ -137,27 +203,20 @@ You MUST return JSON using EXACTLY these field names:
 IMPORTANT:
 
 1. Use `note_index`, NOT `note_id`.
-
 2. Use `directive_type`, NOT `type`.
-
-3. Include exactly one object for every input note.
-
-4. `note_index` must exactly match the input note number.
-
-5. `applies` must be true for every directive except `no_op`.
-
-6. For `no_op`:
+3. Include exactly one object for every input note. `note_index` must exactly match the input note number.
+4. Allowed `directive_type` values are ONLY: "solar_reduction", "minimum_battery_reserve", "no_charge_window", "no_discharge_window", "max_grid_window", "no_op".
+5. CRITICAL TIME RULE: Time windows are start-inclusive and end-exclusive whole hours. For example, '1 PM to 3 PM' maps strictly to hours [13, 14]. 'Noon until 2 PM' maps strictly to hours [12, 13]. DO NOT include the final hour in the array.
+6. `applies` must be true for every directive except `no_op`.
+7. For `no_op`:
    - applies must be false
    - structured_adjustment must be null
-
-7. For all other directive types:
+8. For all other directive types:
    - applies must be true
    - structured_adjustment must NOT be null
-
-8. `hours` is an array of integers from 0 to 23.
+9. `hours` is an array of integers from 0 to 23.
    Use null only when the directive does not require an hour range.
-
-9. Do not use field names other than:
+10. Do not use field names other than:
    - note_index
    - applies
    - directive_type
@@ -167,10 +226,8 @@ IMPORTANT:
    - factor
    - minimum_energy_kwh
    - max_grid_kwh
-
-10. Return ONLY valid JSON.
+11. Return ONLY valid JSON.
 """
-
 
     try:
         completion = await client.chat.completions.create(
@@ -189,15 +246,15 @@ IMPORTANT:
         print(raw_json_response)
         print("============================")
         
-        # 2. Force the JSON string through our Pydantic schema to validate it
+        raw_json_response = completion.choices[0].message.content
         parsed_data = LLMInterpretation.model_validate_json(raw_json_response)
-        
-        # 3. Extract and sort the directives safely
-        interpreted_directives = parsed_data.directives
-        interpreted_directives = sorted(interpreted_directives, key=lambda x: x.note_index)
+        raw_directives = parsed_data.directives
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM parsing failed: {str(e)}")
+
+    total_notes = len(raw_context)
+    interpreted_directives = apply_guardrails(raw_directives, total_notes, batt_capacity)
 
 
     return {
