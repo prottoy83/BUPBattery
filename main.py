@@ -371,22 +371,3 @@ IMPORTANT:
         "plan_summary": "LLM directives successfully applied and schedule mathematically optimized."
     }
 
-
-@app.get("/models")
-async def get_models():
-    try:
-        models = await client.models.list()
-        return {
-            "models": [
-                {
-                    "id": model.id,
-                    "owned_by": model.owned_by
-                }
-                for model in models.data
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
