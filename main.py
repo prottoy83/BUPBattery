@@ -12,7 +12,8 @@ from groq import AsyncGroq
 
 load_dotenv()
 app = FastAPI()
-client = AsyncGroq(api_key=os.getenv("AI_KEY"))
+raw_key = os.getenv("AI_KEY") or os.getenv("GROQ_API_KEY") or "ERRO"
+client = AsyncGroq(api_key=raw_key)
 
 
 class Hour(BaseModel):
