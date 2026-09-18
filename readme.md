@@ -4,7 +4,7 @@ Backend service built for campus energy scheduling and optimization. The applica
 
 ## System Architecture
 
-1. **Directive Extraction:** Queries the Groq API (`llama-3.3-70b-versatile`) with a strict JSON schema prompt to convert text notes into structured adjustments.
+1. **Directive Extraction:** Queries the Groq API (`openai/gpt-oss-120b`) with a strict JSON schema prompt to convert text notes into structured adjustments.
 2. **Deterministic Guardrails:** Sanitizes LLM responses by checking numeric bounds, normalizing time windows (start-inclusive, end-exclusive), and safely falling back to `no_op` values on malformed input.
 3. **Optimization Engine:** Formulates and solves a 24-hour linear programming model via PuLP (CBC solver), handling energy balance, battery capacity, state transitions, and day-neutrality constraints.
 
