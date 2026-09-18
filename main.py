@@ -2,7 +2,7 @@ import os
 import pulp
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from openai import AsyncOpenAI
+
 from dotenv import load_dotenv
 from typing import List
 from typing import List, Optional, Literal
@@ -99,8 +99,13 @@ def apply_guardrails(parsed_directives: List[DirectiveInterpretation], total_not
             else:
                 # 3. Time Normalization: Unique integers 0-23 in ascending order
                 raw_hours = d.structured_adjustment.hours
-                valid_hours = sorted(list(set([h for h in raw_hours if 0 <= h <= 23])))
-                d.structured_adjustment.hours = valid_hours
+                if raw_hours is None:
+                    is_valid = False
+                else:
+                    valid_hours = sorted(list(set([h for h in raw_hours if 0 <= h <= 23])))
+                    d.structured_adjustment.hours = valid_hours
+                    if not valid_hours:
+                        is_valid = False
 
                 # 4. Numeric Bounds Verification
                 if d.directive_type == "solar_reduction":
@@ -230,6 +235,7 @@ IMPORTANT:
 """
 
     try:
+            
         completion = await client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[
@@ -239,16 +245,39 @@ IMPORTANT:
             response_format={"type": "json_object"},
             temperature=0
         )
-        
-        # 1. Extract the raw JSON string from Groq
+
         raw_json_response = completion.choices[0].message.content
         print("===== LLM RAW RESPONSE =====")
         print(raw_json_response)
         print("============================")
-        
-        raw_json_response = completion.choices[0].message.content
-        parsed_data = LLMInterpretation.model_validate_json(raw_json_response)
-        raw_directives = parsed_data.directives
+
+        try:
+            raw_json = json.loads(raw_json_response)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"LLM did not return valid JSON: {str(e)}")
+
+        raw_directive_list = raw_json.get("directives", [])
+        raw_directives = []
+
+        for item in raw_directive_list:
+            try:
+                raw_directives.append(DirectiveInterpretation.model_validate(item))
+            except Exception:
+                continue
+
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"LLM parsing failed: {str(e)}")
+
+        raw_directive_list = raw_json.get("directives", [])
+        raw_directives = []
+
+        for item in raw_directive_list:
+            try:
+                raw_directives.append(DirectiveInterpretation.model_validate(item))
+            except Exception:
+                # Skip malformed entries; apply_guardrails() will fill in
+                # missing note_index values with a safe no_op fallback.
+                continue
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM parsing failed: {str(e)}")
