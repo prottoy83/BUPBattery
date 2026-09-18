@@ -4,7 +4,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from dotenv import load_dotenv
-from typing import List
 from typing import List, Optional, Literal
 
 import json
@@ -14,7 +13,6 @@ from groq import AsyncGroq
 load_dotenv()
 app = FastAPI()
 client = AsyncGroq(api_key=os.getenv("AI_KEY"))
-
 
 
 class Hour(BaseModel):
@@ -66,7 +64,6 @@ class LLMInterpretation(BaseModel):
 
 
 # Guardrail
-
 def apply_guardrails(parsed_directives: List[DirectiveInterpretation], total_notes: int, capacity_kwh: float) -> List[DirectiveInterpretation]:
     safe_directives = []
     
@@ -136,10 +133,10 @@ def apply_guardrails(parsed_directives: List[DirectiveInterpretation], total_not
     return safe_directives
 
 
-
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
 
 @app.post("/optimize-energy")
 async def optimize(request_data: OptimizationRequest):
@@ -172,7 +169,6 @@ async def optimize(request_data: OptimizationRequest):
     max_charge_limits = [max_charge_rate] * 24
     max_discharge_limits = [max_discharge_rate] * 24
     max_grid_limits = [float("inf")] * 24
-
 
     system_prompt = """
 You are a strict energy scheduling assistant.
@@ -235,7 +231,6 @@ IMPORTANT:
 """
 
     try:
-            
         completion = await client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[
@@ -251,11 +246,7 @@ IMPORTANT:
         print(raw_json_response)
         print("============================")
 
-        try:
-            raw_json = json.loads(raw_json_response)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"LLM did not return valid JSON: {str(e)}")
-
+        raw_json = json.loads(raw_json_response)
         raw_directive_list = raw_json.get("directives", [])
         raw_directives = []
 
@@ -263,49 +254,120 @@ IMPORTANT:
             try:
                 raw_directives.append(DirectiveInterpretation.model_validate(item))
             except Exception:
-                continue
-
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"LLM parsing failed: {str(e)}")
-
-        raw_directive_list = raw_json.get("directives", [])
-        raw_directives = []
-
-        for item in raw_directive_list:
-            try:
-                raw_directives.append(DirectiveInterpretation.model_validate(item))
-            except Exception:
-                # Skip malformed entries; apply_guardrails() will fill in
-                # missing note_index values with a safe no_op fallback.
                 continue
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM parsing failed: {str(e)}")
+        print(f"LLM Error: {e}")
+        raw_directives = []
 
+    # -------------------------------------------------------------
+    # 1. Apply Guardrails
+    # -------------------------------------------------------------
     total_notes = len(raw_context)
     interpreted_directives = apply_guardrails(raw_directives, total_notes, batt_capacity)
 
+    # -------------------------------------------------------------
+    # 2. Apply Validated Directives to Hourly Limits
+    # -------------------------------------------------------------
+    for d in interpreted_directives:
+        if not d.applies or not d.structured_adjustment:
+            continue
+            
+        for h in d.structured_adjustment.hours:
+            if 0 <= h <= 23:
+                if d.directive_type == "solar_reduction" and d.structured_adjustment.factor is not None:
+                    effective_solar[h] *= d.structured_adjustment.factor
+                elif d.directive_type == "no_charge_window":
+                    max_charge_limits[h] = 0.0
+                elif d.directive_type == "no_discharge_window":
+                    max_discharge_limits[h] = 0.0
+                elif d.directive_type == "minimum_battery_reserve" and d.structured_adjustment.minimum_energy_kwh is not None:
+                    min_battery_limits[h] = max(min_battery_limits[h], d.structured_adjustment.minimum_energy_kwh)
+                elif d.directive_type == "max_grid_window" and d.structured_adjustment.max_grid_kwh is not None:
+                    max_grid_limits[h] = min(max_grid_limits[h], d.structured_adjustment.max_grid_kwh)
+
+    # -------------------------------------------------------------
+    # 3. PuLP Linear Programming Solver
+    # -------------------------------------------------------------
+    prob = pulp.LpProblem("GridWise_Optimization", pulp.LpMinimize)
+
+    grid = [pulp.LpVariable(f"grid_{h}", lowBound=0) for h in range(24)]
+    solar = [pulp.LpVariable(f"solar_{h}", lowBound=0) for h in range(24)]
+    charge = [pulp.LpVariable(f"charge_{h}", lowBound=0) for h in range(24)]
+    discharge = [pulp.LpVariable(f"discharge_{h}", lowBound=0) for h in range(24)]
+    batt = [pulp.LpVariable(f"batt_{h}", lowBound=0) for h in range(24)]
+
+    prob += pulp.lpSum([grid[h] * tariffs[h] for h in range(24)])
+
+    for h in range(24):
+        prob += solar[h] <= effective_solar[h]
+        prob += charge[h] <= max_charge_limits[h]
+        prob += discharge[h] <= max_discharge_limits[h]
+        if max_grid_limits[h] != float("inf"):
+            prob += grid[h] <= max_grid_limits[h]
+        
+        prob += batt[h] >= min_battery_limits[h]
+        prob += batt[h] <= batt_capacity
+
+        prob += grid[h] + solar[h] + discharge[h] == demands[h] + charge[h]
+
+        if h == 0:
+            prob += batt[h] == batt_initial + charge[h] - discharge[h]
+        else:
+            prob += batt[h] == batt[h-1] + charge[h] - discharge[h]
+
+    prob += batt[23] == batt_initial
+
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+    if pulp.LpStatus[prob.status] != 'Optimal':
+        raise HTTPException(status_code=500, detail="Solver could not find an optimal valid schedule.")
+
+    # -------------------------------------------------------------
+    # 4. Format Final API Response
+    # -------------------------------------------------------------
+    hourly_plan = []
+    tot_grid = 0.0
+    tot_cost = 0.0
+    pk_grid = 0.0
+
+    for h in range(24):
+        g_val = pulp.value(grid[h]) or 0.0
+        s_val = pulp.value(solar[h]) or 0.0
+        c_val = pulp.value(charge[h]) or 0.0
+        d_val = pulp.value(discharge[h]) or 0.0
+        b_val = pulp.value(batt[h]) or 0.0
+        
+        action = "idle"
+        act_kwh = 0.0
+        if c_val > 0.001:
+            action = "charge"
+            act_kwh = c_val
+        elif d_val > 0.001:
+            action = "discharge"
+            act_kwh = d_val
+            
+        hourly_plan.append({
+            "hour": h,
+            "grid_kwh": round(g_val, 4),
+            "solar_used_kwh": round(s_val, 4),
+            "battery_action": action,
+            "battery_kwh": round(act_kwh, 4),
+            "battery_energy_after_kwh": round(b_val, 4)
+        })
+        
+        tot_grid += g_val
+        tot_cost += g_val * tariffs[h]
+        pk_grid = max(pk_grid, g_val)
 
     return {
-        "debug_status": "Parsing Successful",
-        "scenario_received": scene_id,
-        "pre_llm_prompt": pre_llm,
-        "battery_specs": {
-            "capacity": batt_capacity,
-            "starting_energy": batt_initial,
-            "minimum_energy": batt_base_min,
-            "max_charge_rate": max_charge_rate,
-            "max_discharge_rate": max_discharge_rate
-        },
-        "hourly_data_summary": {
-            "total_hours_received": len(sorted_hours),
-            "hour_0_demand": demands[0],
-            "hour_23_tariff": tariffs[-1]
-        },
-        "AI_Data":{
-            "parsed_data": parsed_data,
-            "int_dir": interpreted_directives
-        }
+        "scenario_id": scene_id,
+        "directive_interpretation": [d.model_dump() for d in interpreted_directives],
+        "hourly_plan": hourly_plan,
+        "total_grid_kwh": round(tot_grid, 4),
+        "total_cost_bdt": round(tot_cost, 4),
+        "peak_grid_kwh": round(pk_grid, 4),
+        "plan_summary": "LLM directives successfully applied and schedule mathematically optimized."
     }
 
 
