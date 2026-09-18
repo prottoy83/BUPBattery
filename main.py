@@ -1,4 +1,4 @@
-﻿import os
+import os
 import math
 from typing import List, Optional, Literal
 
@@ -218,7 +218,7 @@ def run_pulp_optimization(
     min_battery_limits = [b_min_default] * 24
     max_charge_limits = [battery.max_charge_kwh_per_hour] * 24
     max_discharge_limits = [battery.max_discharge_kwh_per_hour] * 24
-    max_grid_limits = [float("inf")] * 24
+    max_grid_limits = [None] * 24  # None = unbounded; PuLP does not accept float("inf")
 
     for d in directives:
         if not d.applies or d.directive_type == "no_op" or not d.structured_adjustment:
@@ -246,9 +246,13 @@ def run_pulp_optimization(
                 min_battery_limits[h] = max(min_battery_limits[h], reserve)
 
         elif d.directive_type == "max_grid_window":
-            grid_cap = adj.max_grid_kwh if adj.max_grid_kwh is not None else float("inf")
-            for h in hours:
-                max_grid_limits[h] = min(max_grid_limits[h], grid_cap)
+            grid_cap = adj.max_grid_kwh if adj.max_grid_kwh is not None else None
+            if grid_cap is not None:
+                for h in hours:
+                    if max_grid_limits[h] is None:
+                        max_grid_limits[h] = grid_cap
+                    else:
+                        max_grid_limits[h] = min(max_grid_limits[h], grid_cap)
 
     model = pulp.LpProblem("GridWise_Optimization", pulp.LpMinimize)
 
